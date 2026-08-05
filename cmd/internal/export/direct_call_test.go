@@ -103,7 +103,7 @@ func TestGenerateDirectCalls(t *testing.T) {
 	want := `"example.com/host.Add": {Target: reflect.ValueOf(q.Add), Adapter: qexpDirectCallFunc_Add}
 "(*example.com/host.List).Append": {Target: reflect.ValueOf((*q.List).Append), Adapter: qexpDirectCallMethod_Ptr_List_Append}
 func qexpDirectCallFunc_Add(ctx ixgo.DirectCallContext) {
-	ctx.SetResult(q.Add(ixgo.DirectCallArg[int](ctx, 0), ixgo.DirectCallArg[int](ctx, 1)))
+	ixgo.DirectCallSetResult(ctx, q.Add(ixgo.DirectCallArg[int](ctx, 0), ixgo.DirectCallArg[int](ctx, 1)))
 }
 func qexpDirectCallMethod_Ptr_List_Append(ctx ixgo.DirectCallContext) {
 	(*q.List).Append(ixgo.DirectCallArg[*q.List](ctx, 0), ixgo.DirectCallArg[any](ctx, 1))
@@ -126,16 +126,40 @@ func TestGenerateDirectCallValueMethodAndVariadicFunction(t *testing.T) {
 	}
 	got := strings.Join(testAdapterDeclarations(output), "\n")
 	want := `func qexpDirectCallFunc_Collect(ctx ixgo.DirectCallContext) {
-	ctx.SetResult(q.Collect(ixgo.DirectCallArg[string](ctx, 0), ixgo.DirectCallArg[[]int](ctx, 1)...))
+	ixgo.DirectCallSetResult(ctx, q.Collect(ixgo.DirectCallArg[string](ctx, 0), ixgo.DirectCallArg[[]int](ctx, 1)...))
 }
 func qexpDirectCallMethod_List_Len(ctx ixgo.DirectCallContext) {
-	ctx.SetResult(q.List.Len(ixgo.DirectCallArg[q.List](ctx, 0)))
+	ixgo.DirectCallSetResult(ctx, q.List.Len(ixgo.DirectCallArg[q.List](ctx, 0)))
 }
 func qexpDirectCallMethod_Ptr_List_Len(ctx ixgo.DirectCallContext) {
-	ctx.SetResult((*q.List).Len(ixgo.DirectCallArg[*q.List](ctx, 0)))
+	ixgo.DirectCallSetResult(ctx, (*q.List).Len(ixgo.DirectCallArg[*q.List](ctx, 0)))
 }`
 	if got != want {
 		t.Fatalf("generated adapters differ:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+func TestGenerateDirectCallZeroArgumentCallbacks(t *testing.T) {
+	pkg := types.NewPackage("example.com/host", "host")
+	callback := testSignature(nil, nil, nil, false)
+	predicate := testSignature(nil, nil, []types.Type{types.Typ[types.Bool]}, false)
+	withArg := testSignature(nil, []types.Type{types.Typ[types.Int]}, nil, false)
+	twoResults := testSignature(nil, nil, []types.Type{types.Typ[types.Int], types.Typ[types.Bool]}, false)
+	callbackName := types.NewTypeName(token.NoPos, pkg, "Callback", nil)
+	namedCallback := types.NewNamed(callbackName, callback, nil)
+	pkg.Scope().Insert(callbackName)
+	addTestFunc(pkg, "Run", testSignature(nil, []types.Type{callback, predicate, namedCallback, withArg, twoResults}, nil, false))
+
+	output, err := generateDirectCalls(pkg, "Run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(testAdapterDeclarations(output), "\n")
+	want := `func qexpDirectCallFunc_Run(ctx ixgo.DirectCallContext) {
+	q.Run(ixgo.DirectCallFunc0[func()](ctx, 0), ixgo.DirectCallFunc0Result[func() bool](ctx, 1), ixgo.DirectCallFunc0[q.Callback](ctx, 2), ixgo.DirectCallArg[func(int)](ctx, 3), ixgo.DirectCallArg[func() (int, bool)](ctx, 4))
+}`
+	if got != want {
+		t.Fatalf("generated callback adapter differs:\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
 }
 

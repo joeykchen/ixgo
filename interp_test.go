@@ -1341,6 +1341,113 @@ func testConst() {
 	}
 }
 
+func TestUnOpDerefBasic(t *testing.T) {
+	tests := []struct {
+		typ   string
+		value string
+	}{
+		{"bool", "true"},
+		{"int", "1"},
+		{"int8", "2"},
+		{"int16", "3"},
+		{"int32", "4"},
+		{"int64", "5"},
+		{"uint", "6"},
+		{"uint8", "7"},
+		{"uint16", "8"},
+		{"uint32", "9"},
+		{"uint64", "10"},
+		{"uintptr", "11"},
+		{"float32", "12.5"},
+		{"float64", "13.5"},
+		{"complex64", "14+15i"},
+		{"complex128", "16+17i"},
+		{"string", `"ixgo"`},
+	}
+	for _, test := range tests {
+		t.Run(test.typ, func(t *testing.T) {
+			src := fmt.Sprintf(`package main
+
+var global %[1]s = %[1]s(%[2]s)
+
+func deref(p *%[1]s) any {
+	return *p
+}
+
+func main() {
+	want := %[1]s(%[2]s)
+	if got := any(global); got != any(want) {
+		panic("global dereference changed type or value")
+	}
+	local := want
+	if got := deref(&local); got != any(want) {
+		panic("register dereference changed type or value")
+	}
+}
+`, test.typ, test.value)
+			if _, err := ixgo.RunFile("main.go", src, nil, 0); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestUnOpDerefNamed(t *testing.T) {
+	src := `package main
+
+type NamedInt int
+type NamedString string
+
+var globalInt NamedInt = 42
+var globalString NamedString = "ixgo"
+
+func derefInt(p *NamedInt) any {
+	return *p
+}
+
+func derefString(p *NamedString) any {
+	return *p
+}
+
+func main() {
+	if got, ok := any(globalInt).(NamedInt); !ok || got != NamedInt(42) {
+		panic("global named int changed type or value")
+	}
+	if got, ok := any(globalString).(NamedString); !ok || got != NamedString("ixgo") {
+		panic("global named string changed type or value")
+	}
+	localInt := NamedInt(43)
+	if got, ok := derefInt(&localInt).(NamedInt); !ok || got != localInt {
+		panic("register named int changed type or value")
+	}
+	localString := NamedString("named")
+	if got, ok := derefString(&localString).(NamedString); !ok || got != localString {
+		panic("register named string changed type or value")
+	}
+}
+`
+	if _, err := ixgo.RunFile("main.go", src, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUnOpDerefNil(t *testing.T) {
+	src := `package main
+
+func deref(p *int) int {
+	return *p
+}
+
+func main() {
+	deref(nil)
+}
+`
+	_, err := ixgo.RunFile("main.go", src, nil, 0)
+	if err == nil || !strings.Contains(err.Error(), "invalid memory address or nil pointer dereference") {
+		t.Fatalf("got error %v, want nil pointer dereference", err)
+	}
+}
+
 func TestUnOpSubInt(t *testing.T) {
 	tsrc := `package main
 type T $int

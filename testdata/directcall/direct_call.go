@@ -33,3 +33,35 @@ type Recorder struct {
 func (r *Recorder) Record(value int) {
 	r.Values <- value
 }
+
+// Callback is a named callback type used by direct-call adapter tests.
+type Callback func()
+
+// Repeat calls callback count times.
+func Repeat(count int, callback func()) {
+	for range count {
+		callback()
+	}
+}
+
+// RepeatNamed calls a named callback count times.
+func RepeatNamed(count int, callback Callback) {
+	for range count {
+		callback()
+	}
+}
+
+// Retain returns callback so tests can invoke it after its adapter returns.
+func Retain(callback func()) func() {
+	return callback
+}
+
+// Check returns the result of condition.
+func Check(condition func() bool) bool {
+	return condition()
+}
+
+// CheckError returns the result of callback.
+func CheckError(callback func() error) error {
+	return callback()
+}

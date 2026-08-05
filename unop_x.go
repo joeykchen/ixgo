@@ -17,6 +17,7 @@
 package ixgo
 
 import (
+	"go/types"
 	"reflect"
 
 	"github.com/visualfc/xtype"
@@ -55,14 +56,57 @@ func makeUnOpNOT(pfn *function, instr *ssa.UnOp) func(fr *frame) {
 func makeUnOpMUL(pfn *function, instr *ssa.UnOp) func(fr *frame) {
 	ir := pfn.regIndex(instr)
 	ix, kx, vx := pfn.regIndex3(instr.X)
+	// These two types dominate measured dereference traffic. Keeping their
+	// values typed avoids reflect.Value.Interface boxing on the hot path.
+	basic, _ := types.Unalias(instr.Type()).(*types.Basic)
 	if kx == kindGlobal {
-		v := reflect.ValueOf(vx)
+		ptr := reflect.ValueOf(vx)
+		if basic != nil {
+			switch basic.Kind() {
+			case types.Int:
+				return func(fr *frame) {
+					elem := ptr.Elem()
+					if !elem.IsValid() {
+						panic(fr.runtimeError(instr, "invalid memory address or nil pointer dereference"))
+					}
+					fr.setReg(ir, int(elem.Int()))
+				}
+			case types.Float64:
+				return func(fr *frame) {
+					elem := ptr.Elem()
+					if !elem.IsValid() {
+						panic(fr.runtimeError(instr, "invalid memory address or nil pointer dereference"))
+					}
+					fr.setReg(ir, elem.Float())
+				}
+			}
+		}
 		return func(fr *frame) {
-			elem := v.Elem()
+			elem := ptr.Elem()
 			if !elem.IsValid() {
 				panic(fr.runtimeError(instr, "invalid memory address or nil pointer dereference"))
 			}
 			fr.setReg(ir, elem.Interface())
+		}
+	}
+	if basic != nil {
+		switch basic.Kind() {
+		case types.Int:
+			return func(fr *frame) {
+				elem := reflect.ValueOf(fr.reg(ix)).Elem()
+				if !elem.IsValid() {
+					panic(fr.runtimeError(instr, "invalid memory address or nil pointer dereference"))
+				}
+				fr.setReg(ir, int(elem.Int()))
+			}
+		case types.Float64:
+			return func(fr *frame) {
+				elem := reflect.ValueOf(fr.reg(ix)).Elem()
+				if !elem.IsValid() {
+					panic(fr.runtimeError(instr, "invalid memory address or nil pointer dereference"))
+				}
+				fr.setReg(ir, elem.Float())
+			}
 		}
 	}
 	return func(fr *frame) {

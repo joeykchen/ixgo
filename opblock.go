@@ -164,15 +164,19 @@ func (p *function) allocFrame(caller *frame) *frame {
 		fr.stack = append([]value{}, p.stack...)
 	}
 	fr.caller = caller
-	fr.deferid = caller.deferid
-	caller.callee = fr
+	if caller != nil {
+		fr.deferid = caller.deferid
+		caller.callee = fr
+	} else {
+		fr.deferid = 0
+	}
 	return fr
 }
 
 func (p *function) deleteFrame(caller *frame, fr *frame) {
 	if atomic.LoadInt32(&p.cached) == 1 {
 		p.pool.Put(fr)
-	} else {
+	} else if caller != nil {
 		caller.callee = nil
 	}
 	fr = nil
@@ -397,6 +401,9 @@ func makeInstr(interp *Interp, pfn *function, instr ssa.Instruction) func(fr *fr
 	case *ssa.Call:
 		return makeCallInstr(pfn, interp, instr, &instr.Call)
 	case *ssa.BinOp:
+		if run := makeReusableScalarBinOp(pfn, interp, instr); run != nil {
+			return run
+		}
 		switch instr.Op {
 		case token.ADD:
 			return makeBinOpADD(pfn, instr)
@@ -436,6 +443,9 @@ func makeInstr(interp *Interp, pfn *function, instr ssa.Instruction) func(fr *fr
 			panic("unreachable")
 		}
 	case *ssa.UnOp:
+		if run := makeReusableScalarUnOp(pfn, interp, instr); run != nil {
+			return run
+		}
 		switch instr.Op {
 		case token.NOT:
 			return makeUnOpNOT(pfn, instr)
@@ -582,11 +592,18 @@ func makeInstr(interp *Interp, pfn *function, instr ssa.Instruction) func(fr *fr
 	case *ssa.FieldAddr:
 		ir := pfn.regIndex(instr)
 		ix := pfn.regIndex(instr.X)
+		receiverCache := register(len(pfn.stack))
+		pfn.stack = append(pfn.stack, nil)
 		return func(fr *frame) {
-			v, err := fieldAddrX(fr.reg(ix), instr.Field)
+			receiver := fr.reg(ix)
+			if fr.stack[ir] != nil && fr.stack[receiverCache] == receiver {
+				return
+			}
+			v, err := fieldAddrX(receiver, instr.Field)
 			if err != nil {
 				panic(fr.runtimeError(instr, err.Error()))
 			}
+			fr.stack[receiverCache] = receiver
 			fr.setReg(ir, v)
 		}
 	case *ssa.Field:
@@ -809,6 +826,9 @@ func makeInstr(interp *Interp, pfn *function, instr ssa.Instruction) func(fr *fr
 			fr.ipc = fr.pfn.Blocks[fr.block.Index]
 		}
 	case *ssa.If:
+		if run := makeReusableScalarIf(pfn, interp, instr); run != nil {
+			return run
+		}
 		ic, kc, vc := pfn.regIndex3(instr.Cond)
 		if kc == kindConst {
 			if xtype.Bool(vc) {
@@ -1055,6 +1075,27 @@ func getCallIndex(pfn *function, call *ssa.CallCommon) (iv register, ia []regist
 	return
 }
 
+func isNoopFunction(fn *ssa.Function) bool {
+	if fn == nil || fn.Signature.Results().Len() != 0 || len(fn.Blocks) != 1 {
+		return false
+	}
+	foundReturn := false
+	for _, instr := range fn.Blocks[0].Instrs {
+		switch instr := instr.(type) {
+		case *ssa.DebugRef:
+			return false
+		case *ssa.Return:
+			if len(instr.Results) != 0 {
+				return false
+			}
+			foundReturn = true
+		default:
+			return false
+		}
+	}
+	return foundReturn
+}
+
 var (
 	typFramePtr = reflect.TypeOf((*frame)(nil))
 )
@@ -1068,6 +1109,9 @@ func makeCallInstr(pfn *function, interp *Interp, instr ssa.Value, call *ssa.Cal
 	case *ssa.MakeClosure:
 		ifn := interp.loadFunction(fn.Fn.(*ssa.Function))
 		ia = append(ia, ib...)
+		if interp.ctx.Mode&EnableTracing == 0 && isNoopFunction(ifn.Fn) {
+			return func(fr *frame) {}
+		}
 		if ifn.Recover == nil {
 			switch ifn.nres {
 			case 0:
@@ -1114,7 +1158,7 @@ func makeCallInstr(pfn *function, interp *Interp, instr ssa.Value, call *ssa.Cal
 					interp.callExternalWithFrameByStack(fr, ext, ir, ia)
 				}
 			}
-			if run := makeStaticDirectCallInstr(interp, fn, ext, ir, ia); run != nil {
+			if run := makeStaticDirectCallInstr(interp, fn, ext, instr, ir, ia); run != nil {
 				return run
 			}
 			return func(fr *frame) {
@@ -1122,6 +1166,9 @@ func makeCallInstr(pfn *function, interp *Interp, instr ssa.Value, call *ssa.Cal
 			}
 		}
 		ifn := interp.loadFunction(fn)
+		if interp.ctx.Mode&EnableTracing == 0 && isNoopFunction(fn) {
+			return func(fr *frame) {}
+		}
 		if ifn.Recover == nil {
 			switch ifn.nres {
 			case 0:

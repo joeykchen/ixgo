@@ -82,19 +82,29 @@ const supportFuncVal = funcval.IsSupport
 func dynamicFunCall(interp *Interp, iv register, ir register, ia []register) func(fr *frame) {
 	return func(fr *frame) {
 		fn := fr.reg(iv)
-		if fv, n := funcval.Get(fn); n == 1 {
-			if c := (*makeFuncVal)(unsafe.Pointer(fv)); c.interp == interp {
-				if c.pfn.Recover == nil {
-					interp.callFunctionByStackNoRecoverWithEnv(fr, c.pfn, ir, ia, c.env)
-				} else {
-					interp.callFunctionByStackWithEnv(fr, c.pfn, ir, ia, c.env)
-				}
-				return
+		if c := interp.getInterpretedFunc(fn); c != nil {
+			if c.pfn.Recover == nil {
+				interp.callFunctionByStackNoRecoverWithEnv(fr, c.pfn, ir, ia, c.env)
+			} else {
+				interp.callFunctionByStackWithEnv(fr, c.pfn, ir, ia, c.env)
 			}
+			return
 		}
 		v := reflect.ValueOf(fn)
 		interp.callExternalByStack(fr, v, ir, ia)
 	}
+}
+
+func (i *Interp) getInterpretedFunc(fn any) *makeFuncVal {
+	if !supportFuncVal || fn == nil {
+		return nil
+	}
+	if fv, n := funcval.Get(fn); n == 1 {
+		if call := (*makeFuncVal)(unsafe.Pointer(fv)); call.interp == i {
+			return call
+		}
+	}
+	return nil
 }
 
 func (pfn *function) makeFunction(typ reflect.Type, env []value) reflect.Value {

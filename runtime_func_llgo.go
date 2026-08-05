@@ -82,7 +82,7 @@ const supportFuncVal = true
 func dynamicFunCall(interp *Interp, iv register, ir register, ia []register) func(fr *frame) {
 	return func(fr *frame) {
 		fn := fr.reg(iv)
-		if c := interp.getMakeFuncVal(fn); c != nil && c.interp == interp {
+		if c := interp.getInterpretedFunc(fn); c != nil {
 			if c.pfn.Recover == nil {
 				interp.callFunctionByStackNoRecoverWithEnv(fr, c.pfn, ir, ia, c.env)
 			} else {
@@ -93,6 +93,16 @@ func dynamicFunCall(interp *Interp, iv register, ir register, ia []register) fun
 		v := reflect.ValueOf(fn)
 		interp.callExternalByStack(fr, v, ir, ia)
 	}
+}
+
+func (i *Interp) getInterpretedFunc(fn any) *makeFuncVal {
+	if fn == nil {
+		return nil
+	}
+	if call := i.getMakeFuncVal(fn); call != nil && call.interp == i {
+		return call
+	}
+	return nil
 }
 
 type interpExt struct {

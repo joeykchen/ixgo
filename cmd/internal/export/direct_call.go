@@ -71,17 +71,37 @@ func (r *directCallRenderer) registryEntry(binding directCallBinding) string {
 	return fmt.Sprintf("%q: {Target: %s.ValueOf(%s), Adapter: %s}", binding.key, r.reflectAlias, r.targetExpr(binding), binding.adapterName)
 }
 
+func (r *directCallRenderer) argumentExpr(binding directCallBinding, typ types.Type, index int) string {
+	typeExpr := r.typeExpr(typ)
+	fallback := fmt.Sprintf("%s.DirectCallArg[%s](ctx, %d)", r.runtimeAlias, typeExpr, index)
+	if binding.receiver != nil && index == 0 {
+		return fallback
+	}
+	sig, ok := types.Unalias(typ).Underlying().(*types.Signature)
+	if !ok || sig.Recv() != nil || sig.Params().Len() != 0 || sig.Variadic() {
+		return fallback
+	}
+	switch sig.Results().Len() {
+	case 0:
+		return fmt.Sprintf("%s.DirectCallFunc0[%s](ctx, %d)", r.runtimeAlias, typeExpr, index)
+	case 1:
+		return fmt.Sprintf("%s.DirectCallFunc0Result[%s](ctx, %d)", r.runtimeAlias, typeExpr, index)
+	default:
+		return fallback
+	}
+}
+
 func (r *directCallRenderer) adapterDeclaration(binding directCallBinding) string {
 	args := make([]string, len(binding.argumentTypes))
 	for i, typ := range binding.argumentTypes {
-		args[i] = fmt.Sprintf("%s.DirectCallArg[%s](ctx, %d)", r.runtimeAlias, r.typeExpr(typ), i)
+		args[i] = r.argumentExpr(binding, typ, i)
 	}
 	if binding.variadic {
 		args[len(args)-1] += "..."
 	}
 	call := fmt.Sprintf("%s(%s)", r.targetExpr(binding), strings.Join(args, ", "))
 	if binding.hasResult {
-		call = "ctx.SetResult(" + call + ")"
+		call = r.runtimeAlias + ".DirectCallSetResult(ctx, " + call + ")"
 	}
 	return fmt.Sprintf("func %s(ctx %s.DirectCallContext) {\n\t%s\n}", binding.adapterName, r.runtimeAlias, call)
 }

@@ -26,20 +26,106 @@ import (
 // DirectCallContext gives a generated direct-call adapter access to the
 // current call's arguments and result register.
 type DirectCallContext struct {
-	frame  *frame
-	result register
-	args   []register
+	frame       *frame
+	result      register
+	args        []register
+	reuseResult bool
+}
+
+type reusableValue[T any] struct {
+	value T
 }
 
 // DirectCallArg returns the argument at index using its generated static type.
 // A nil interface value is converted to the zero value of T.
 func DirectCallArg[T any](ctx DirectCallContext, index int) T {
-	v := ctx.frame.reg(ctx.args[index])
+	v := ctx.frame.stack[ctx.args[index]]
+	if reusable, ok := v.(*reusableValue[T]); ok {
+		return reusable.value
+	}
 	if v == nil {
 		var zero T
 		return zero
 	}
 	return v.(T)
+}
+
+// DirectCallSetResult stores a generated adapter result. Eligible callsites
+// reuse typed storage when all consumers can read it without interface boxing.
+func DirectCallSetResult[T any](ctx DirectCallContext, result T) {
+	setReusableValue(ctx.frame, ctx.result, ctx.reuseResult, result)
+}
+
+func setReusableValue[T any](fr *frame, result register, reusable bool, value T) {
+	if !reusable {
+		fr.setReg(result, value)
+		return
+	}
+	if slot, ok := fr.stack[result].(*reusableValue[T]); ok {
+		slot.value = value
+		return
+	}
+	fr.stack[result] = &reusableValue[T]{value: value}
+}
+
+// DirectCallFunc0 returns a zero-argument callback using its generated static
+// type. Interpreted callbacks bypass their reflect.MakeFunc bridge; native
+// callbacks are returned unchanged. The optimized callback owns the
+// interpreter function and closure environment, so it remains valid if the
+// callee retains it after the direct-call adapter returns.
+func DirectCallFunc0[F ~func()](ctx DirectCallContext, index int) F {
+	callback := DirectCallArg[F](ctx, index)
+	if callback == nil {
+		return callback
+	}
+	call := directCallFuncValue(ctx, index)
+	if call == nil {
+		return callback
+	}
+	interp, pfn, env := call.interp, call.pfn, call.env
+	if pfn.Recover == nil {
+		return F(func() {
+			interp.callFunctionDiscardsResultNoRecover(interp.activeDeferFrame(), pfn, nil, env)
+		})
+	}
+	return F(func() {
+		interp.callFunctionDiscardsResult(interp.activeDeferFrame(), pfn, nil, env)
+	})
+}
+
+// DirectCallFunc0Result is DirectCallFunc0 for callbacks with one result.
+func DirectCallFunc0Result[F ~func() R, R any](ctx DirectCallContext, index int) F {
+	callback := DirectCallArg[F](ctx, index)
+	if callback == nil {
+		return callback
+	}
+	call := directCallFuncValue(ctx, index)
+	if call == nil {
+		return callback
+	}
+	interp, pfn, env := call.interp, call.pfn, call.env
+	if pfn.Recover == nil {
+		return F(func() R {
+			result := interp.callFunctionNoRecover(interp.activeDeferFrame(), pfn, nil, env)
+			if result == nil {
+				var zero R
+				return zero
+			}
+			return result.(R)
+		})
+	}
+	return F(func() R {
+		result := interp.callFunction(interp.activeDeferFrame(), pfn, nil, env)
+		if result == nil {
+			var zero R
+			return zero
+		}
+		return result.(R)
+	})
+}
+
+func directCallFuncValue(ctx DirectCallContext, index int) *makeFuncVal {
+	return ctx.frame.interp.getInterpretedFunc(ctx.frame.reg(ctx.args[index]))
 }
 
 // SetResult stores the result produced by a generated direct-call adapter.
@@ -184,19 +270,83 @@ func resolveStaticDirectCall(interp *Interp, fn *ssa.Function, resolved reflect.
 	return binding.Adapter, true
 }
 
-func makeStaticDirectCallInstr(interp *Interp, fn *ssa.Function, resolved reflect.Value, result register, args []register) func(*frame) {
+func makeStaticDirectCallInstr(interp *Interp, fn *ssa.Function, resolved reflect.Value, resultValue ssa.Value, result register, args []register) func(*frame) {
 	adapter, ok := resolveStaticDirectCall(interp, fn, resolved)
 	if !ok {
 		return nil
 	}
+	reuseResult := canReuseValue(interp, resultValue)
 	return func(fr *frame) {
-		interp.invokeDirectCall(fr, adapter, result, args)
+		interp.invokeDirectCallWithResultMode(fr, adapter, result, args, reuseResult)
 	}
 }
 
+func reusableValueNeedsBoxing(typ types.Type) bool {
+	typ = types.Unalias(typ)
+	if named, ok := typ.(*types.Named); ok {
+		return reusableValueNeedsBoxing(named.Underlying())
+	}
+	// Assigning an interface to another interface reuses its existing box.
+	if _, ok := typ.(*types.Interface); ok {
+		return false
+	}
+	return !isDirectInterfaceType(typ)
+}
+
+// isDirectInterfaceType mirrors the runtime's direct-interface shape rule.
+// Values with these shapes already fit in an interface data word, so wrapping
+// them in reusable storage would add indirection without avoiding allocation.
+func isDirectInterfaceType(typ types.Type) bool {
+	typ = types.Unalias(typ)
+	switch typ := typ.(type) {
+	case *types.Named:
+		return isDirectInterfaceType(typ.Underlying())
+	case *types.Pointer, *types.Map, *types.Chan, *types.Signature:
+		return true
+	case *types.Basic:
+		return typ.Kind() == types.UnsafePointer
+	case *types.Array:
+		return typ.Len() == 1 && isDirectInterfaceType(typ.Elem())
+	case *types.Struct:
+		return typ.NumFields() == 1 && isDirectInterfaceType(typ.Field(0).Type())
+	default:
+		return false
+	}
+}
+
+func directCallConsumesValue(interp *Interp, referrer ssa.Instruction, result ssa.Value) bool {
+	call, ok := referrer.(*ssa.Call)
+	if !ok || !directCallUsesValue(&call.Call, result) {
+		return false
+	}
+	fn, ok := call.Call.Value.(*ssa.Function)
+	if !ok || fn.Blocks != nil {
+		return false
+	}
+	resolved, ok := findExternFunc(interp, fn)
+	if !ok {
+		return false
+	}
+	_, ok = resolveStaticDirectCall(interp, fn, resolved)
+	return ok
+}
+
+func directCallUsesValue(call *ssa.CallCommon, target ssa.Value) bool {
+	for _, arg := range call.Args {
+		if arg == target {
+			return true
+		}
+	}
+	return false
+}
+
 func (i *Interp) invokeDirectCall(fr *frame, adapter DirectCallAdapter, result register, args []register) {
+	i.invokeDirectCallWithResultMode(fr, adapter, result, args, false)
+}
+
+func (i *Interp) invokeDirectCallWithResultMode(fr *frame, adapter DirectCallAdapter, result register, args []register, reuseResult bool) {
 	i.trackDeferFrame(fr)
-	adapter(DirectCallContext{frame: fr, result: result, args: args})
+	adapter(DirectCallContext{frame: fr, result: result, args: args, reuseResult: reuseResult})
 }
 
 func (i *Interp) trackDeferFrame(fr *frame) {

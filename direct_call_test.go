@@ -17,13 +17,17 @@
 package ixgo
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"go/token"
 	"go/types"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	directcalltest "github.com/goplus/ixgo/testdata/directcall"
 	"golang.org/x/tools/go/ssa"
@@ -93,6 +97,29 @@ func registerHostDirectCallPackage(key string, binding DirectCallBinding) {
 	})
 }
 
+func registerHostCallbackDirectCallPackage(bindings map[string]DirectCallBinding) {
+	RegisterPackage(&Package{
+		Name:       "directcall",
+		Path:       testDirectCallHostPkgPath,
+		Interfaces: map[string]reflect.Type{},
+		NamedTypes: map[string]reflect.Type{
+			"Callback": reflect.TypeOf(directcalltest.Callback(nil)),
+		},
+		AliasTypes: map[string]reflect.Type{},
+		Vars:       map[string]reflect.Value{},
+		Funcs: map[string]reflect.Value{
+			"Check":       reflect.ValueOf(directcalltest.Check),
+			"CheckError":  reflect.ValueOf(directcalltest.CheckError),
+			"Repeat":      reflect.ValueOf(directcalltest.Repeat),
+			"RepeatNamed": reflect.ValueOf(directcalltest.RepeatNamed),
+			"Retain":      reflect.ValueOf(directcalltest.Retain),
+		},
+		DirectCalls:   bindings,
+		TypedConsts:   map[string]TypedConst{},
+		UntypedConsts: map[string]UntypedConst{},
+	})
+}
+
 type installedPackageLoader struct {
 	Loader
 	path string
@@ -121,6 +148,292 @@ func TestDirectCallContext(t *testing.T) {
 	ctx.SetResult(42)
 	if got := fr.reg(1); got != 42 {
 		t.Fatalf("result = %v; want 42", got)
+	}
+}
+
+func TestDirectCallTypedResultReuse(t *testing.T) {
+	type result struct {
+		value int
+	}
+	fr := &frame{stack: make([]value, 1)}
+	ctx := DirectCallContext{frame: fr, result: 0, args: []register{0}, reuseResult: true}
+
+	DirectCallSetResult(ctx, result{value: 1})
+	boxed, ok := fr.stack[0].(*reusableValue[result])
+	if !ok {
+		t.Fatalf("boxed result type = %T", fr.stack[0])
+	}
+	if got := DirectCallArg[result](ctx, 0); got.value != 1 {
+		t.Fatalf("boxed result = %v; want 1", got.value)
+	}
+
+	DirectCallSetResult(ctx, result{value: 2})
+	if fr.stack[0] != boxed {
+		t.Fatal("typed result box was not reused")
+	}
+	if got := DirectCallArg[result](ctx, 0); got.value != 2 {
+		t.Fatalf("reused boxed result = %v; want 2", got.value)
+	}
+
+	ctx.reuseResult = false
+	DirectCallSetResult(ctx, result{value: 3})
+	if _, ok := fr.stack[0].(*reusableValue[result]); ok {
+		t.Fatal("unboxed result retained the typed result box")
+	}
+}
+
+func TestDirectCallFuncNativeFallback(t *testing.T) {
+	type callback func()
+	interp := &Interp{}
+	var calls int
+	native := callback(func() { calls++ })
+	fr := &frame{interp: interp, stack: []value{native}}
+	ctx := DirectCallContext{frame: fr, args: []register{0}}
+	DirectCallFunc0[callback](ctx, 0)()
+	if calls != 1 {
+		t.Fatalf("native callback calls = %d; want 1", calls)
+	}
+
+	fr.stack[0] = func() bool { return true }
+	if !DirectCallFunc0Result[func() bool](ctx, 0)() {
+		t.Fatal("native predicate result = false; want true")
+	}
+
+	var nilCallback func()
+	fr.stack[0] = nilCallback
+	if got := DirectCallFunc0[func()](ctx, 0); got != nil {
+		t.Fatal("nil native callback became non-nil")
+	}
+}
+
+func TestDirectCallInterpretedCallbacks(t *testing.T) {
+	keys := struct {
+		check       string
+		checkError  string
+		repeat      string
+		repeatNamed string
+		retain      string
+	}{
+		check:       testDirectCallHostPkgPath + ".Check",
+		checkError:  testDirectCallHostPkgPath + ".CheckError",
+		repeat:      testDirectCallHostPkgPath + ".Repeat",
+		repeatNamed: testDirectCallHostPkgPath + ".RepeatNamed",
+		retain:      testDirectCallHostPkgPath + ".Retain",
+	}
+	for _, key := range []string{keys.check, keys.checkError, keys.repeat, keys.repeatNamed, keys.retain} {
+		clearExternalCallOverride(t, key)
+	}
+	var interpretedCallbacks int
+	var capturedCallback func()
+	markInterpreted := func(ctx DirectCallContext, index int) {
+		if directCallFuncValue(ctx, index) != nil {
+			interpretedCallbacks++
+		}
+	}
+	registerHostCallbackDirectCallPackage(map[string]DirectCallBinding{
+		keys.check: newDirectCallBinding(directcalltest.Check, func(ctx DirectCallContext) {
+			markInterpreted(ctx, 0)
+			ctx.SetResult(directcalltest.Check(DirectCallFunc0Result[func() bool](ctx, 0)))
+		}),
+		keys.checkError: newDirectCallBinding(directcalltest.CheckError, func(ctx DirectCallContext) {
+			markInterpreted(ctx, 0)
+			ctx.SetResult(directcalltest.CheckError(DirectCallFunc0Result[func() error](ctx, 0)))
+		}),
+		keys.repeat: newDirectCallBinding(directcalltest.Repeat, func(ctx DirectCallContext) {
+			markInterpreted(ctx, 1)
+			directcalltest.Repeat(DirectCallArg[int](ctx, 0), DirectCallFunc0[func()](ctx, 1))
+		}),
+		keys.repeatNamed: newDirectCallBinding(directcalltest.RepeatNamed, func(ctx DirectCallContext) {
+			markInterpreted(ctx, 1)
+			directcalltest.RepeatNamed(DirectCallArg[int](ctx, 0), DirectCallFunc0[directcalltest.Callback](ctx, 1))
+		}),
+		keys.retain: newDirectCallBinding(directcalltest.Retain, func(ctx DirectCallContext) {
+			markInterpreted(ctx, 0)
+			capturedCallback = DirectCallArg[func()](ctx, 0)
+			ctx.SetResult(directcalltest.Retain(DirectCallFunc0[func()](ctx, 0)))
+		}),
+	})
+
+	const source = `package main
+
+import host "github.com/goplus/ixgo/testdata/directcall"
+
+func recoverCallbackPanic() (got any) {
+	defer func() { got = recover() }()
+	host.Repeat(1, func() { panic("boom") })
+	return "not recovered"
+}
+
+func recoverDeferredCallback() (got any) {
+	defer host.Retain(func() { got = recover() })()
+	panic("deferred")
+}
+
+func main() {
+	count := 0
+	retained := host.Retain(func() { count++ })
+	retained()
+	host.Repeat(3, func() { count++ })
+	host.RepeatNamed(2, host.Callback(func() { count++ }))
+	if count != 6 {
+		panic(count)
+	}
+	if !host.Check(func() bool { return count == 6 }) {
+		panic("predicate failed")
+	}
+	if err := host.CheckError(func() error { return nil }); err != nil {
+		panic(err)
+	}
+	if got := recoverCallbackPanic(); got != "boom" {
+		panic(got)
+	}
+	if got := recoverDeferredCallback(); got != "deferred" {
+		panic(got)
+	}
+}
+`
+	if _, err := NewContext(0).RunFile("main.go", source, nil); err != nil {
+		t.Fatal(err)
+	}
+	if interpretedCallbacks != 7 {
+		t.Fatalf("interpreted callback arguments = %d; want 7", interpretedCallbacks)
+	}
+	foreignInterp := &Interp{}
+	foreignFrame := &frame{interp: foreignInterp, stack: []value{capturedCallback}}
+	foreignContext := DirectCallContext{frame: foreignFrame, args: []register{0}}
+	if call := directCallFuncValue(foreignContext, 0); call != nil {
+		t.Fatal("callback from another interpreter used the direct path")
+	}
+	if callback := DirectCallFunc0[func()](foreignContext, 0); callback == nil {
+		t.Fatal("callback from another interpreter was not preserved")
+	}
+}
+
+func TestDirectCallCallbackAbort(t *testing.T) {
+	repeatKey := testDirectCallHostPkgPath + ".Repeat"
+	checkKey := testDirectCallHostPkgPath + ".Check"
+	clearExternalCallOverride(t, repeatKey)
+	clearExternalCallOverride(t, checkKey)
+
+	callbackEntered := make(chan struct{})
+	var signalOnce sync.Once
+	var usedDirectCallback bool
+	registerHostCallbackDirectCallPackage(map[string]DirectCallBinding{
+		repeatKey: newDirectCallBinding(directcalltest.Repeat, func(ctx DirectCallContext) {
+			usedDirectCallback = directCallFuncValue(ctx, 1) != nil
+			directcalltest.Repeat(DirectCallArg[int](ctx, 0), DirectCallFunc0[func()](ctx, 1))
+		}),
+		checkKey: newDirectCallBinding(directcalltest.Check, func(ctx DirectCallContext) {
+			signalOnce.Do(func() { close(callbackEntered) })
+			ctx.SetResult(directcalltest.Check(DirectCallFunc0Result[func() bool](ctx, 0)))
+		}),
+	})
+
+	const source = `package main
+
+import host "github.com/goplus/ixgo/testdata/directcall"
+
+func main() {
+	host.Repeat(1, func() {
+		host.Check(func() bool { return true })
+		for {}
+	})
+}
+`
+	ctx := NewContext(0)
+	pkg, err := ctx.LoadFile("main.go", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	interp, err := ctx.NewInterp(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer interp.UnsafeRelease()
+	if err := interp.RunInit(); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := interp.RunMain()
+		done <- err
+	}()
+	select {
+	case <-callbackEntered:
+	case <-time.After(time.Second):
+		interp.Abort()
+		t.Fatal("direct callback did not start")
+	}
+	if !usedDirectCallback {
+		interp.Abort()
+		t.Fatal("callback did not use the direct path")
+	}
+
+	interp.Abort()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunMain after Abort: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("direct callback ignored Abort")
+	}
+}
+
+func TestDirectCallCallbackRunContextCancellation(t *testing.T) {
+	repeatKey := testDirectCallHostPkgPath + ".Repeat"
+	clearExternalCallOverride(t, repeatKey)
+
+	callbackEntered := make(chan struct{})
+	var signalOnce sync.Once
+	var usedDirectCallback bool
+	registerHostCallbackDirectCallPackage(map[string]DirectCallBinding{
+		repeatKey: newDirectCallBinding(directcalltest.Repeat, func(ctx DirectCallContext) {
+			usedDirectCallback = directCallFuncValue(ctx, 1) != nil
+			signalOnce.Do(func() { close(callbackEntered) })
+			directcalltest.Repeat(DirectCallArg[int](ctx, 0), DirectCallFunc0[func()](ctx, 1))
+		}),
+	})
+
+	const source = `package main
+
+import host "github.com/goplus/ixgo/testdata/directcall"
+
+func main() {
+	host.Repeat(1, func() { for {} })
+}
+`
+	ctx := NewContext(0)
+	pkg, err := ctx.LoadFile("main.go", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	interp, err := ctx.NewInterp(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer interp.UnsafeRelease()
+
+	runContext, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx.RunContext = runContext
+	go func() {
+		select {
+		case <-callbackEntered:
+		case <-time.After(time.Second):
+		}
+		cancel()
+	}()
+	exitCode, err := ctx.RunInterp(interp, "main.go", nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunInterp error = %v; want context.Canceled", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("RunInterp exit code = %d; want 0", exitCode)
+	}
+	if !usedDirectCallback {
+		t.Fatal("callback did not use the direct path")
 	}
 }
 
@@ -1101,5 +1414,112 @@ func BenchmarkDirectCall(b *testing.B) {
 			}
 			interp.callExternalByStack(methodFrame, fn, 1, methodArgs)
 		}
+	})
+}
+
+func BenchmarkDirectCallCallback(b *testing.B) {
+	key := testDirectCallHostPkgPath + ".Retain"
+	clearExternalCallOverride(b, key)
+	var reflectedCallback func()
+	var directCallback func()
+	var callbackInterp *Interp
+	registerHostCallbackDirectCallPackage(map[string]DirectCallBinding{
+		key: newDirectCallBinding(directcalltest.Retain, func(ctx DirectCallContext) {
+			callbackInterp = ctx.frame.interp
+			reflectedCallback = DirectCallArg[func()](ctx, 0)
+			directCallback = DirectCallFunc0[func()](ctx, 0)
+			ctx.SetResult(directcalltest.Retain(directCallback))
+		}),
+	})
+
+	const source = `package main
+
+import host "github.com/goplus/ixgo/testdata/directcall"
+
+var sink int
+var retained func()
+
+func main() {
+	retained = host.Retain(func() { sink++ })
+}
+`
+	if _, err := NewContext(0).RunFile("main.go", source, nil); err != nil {
+		b.Fatal(err)
+	}
+	if callbackInterp == nil || reflectedCallback == nil || directCallback == nil {
+		b.Fatal("callback adapter did not capture both paths")
+	}
+	callbackFrame := &frame{interp: callbackInterp, stack: []value{reflectedCallback}}
+	callbackContext := DirectCallContext{frame: callbackFrame, args: []register{0}}
+	if directCallFuncValue(callbackContext, 0) == nil {
+		b.Fatal("captured callback is not recognized as interpreted")
+	}
+
+	b.Run("create", func(b *testing.B) {
+		b.Run("reflect", func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				callback := DirectCallArg[func()](callbackContext, 0)
+				runtime.KeepAlive(callback)
+			}
+		})
+		b.Run("direct", func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				callback := DirectCallFunc0[func()](callbackContext, 0)
+				runtime.KeepAlive(callback)
+			}
+		})
+	})
+	b.Run("once", func(b *testing.B) {
+		b.Run("reflect", func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				DirectCallArg[func()](callbackContext, 0)()
+			}
+		})
+		b.Run("direct", func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				DirectCallFunc0[func()](callbackContext, 0)()
+			}
+		})
+	})
+	b.Run("repeat", func(b *testing.B) {
+		const callsPerIteration = 16
+		b.Run("reflect", func(b *testing.B) {
+			b.ReportAllocs()
+			b.ReportMetric(callsPerIteration, "calls/op")
+			for b.Loop() {
+				callback := DirectCallArg[func()](callbackContext, 0)
+				for range callsPerIteration {
+					callback()
+				}
+			}
+		})
+		b.Run("direct", func(b *testing.B) {
+			b.ReportAllocs()
+			b.ReportMetric(callsPerIteration, "calls/op")
+			for b.Loop() {
+				callback := DirectCallFunc0[func()](callbackContext, 0)
+				for range callsPerIteration {
+					callback()
+				}
+			}
+		})
+	})
+	b.Run("retain", func(b *testing.B) {
+		b.Run("reflect", func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				reflectedCallback()
+			}
+		})
+		b.Run("direct", func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				directCallback()
+			}
+		})
 	})
 }
